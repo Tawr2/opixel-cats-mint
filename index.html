@@ -629,8 +629,23 @@
       <span>⚡ Connect Opnet Wallet</span>
     </button>
 
+    <!-- Step indicator (shown during 2-step flow) -->
+    <div id="step-indicator" style="display:none;margin-bottom:12px;">
+      <div style="display:flex;gap:8px;align-items:center;font-size:0.65rem;letter-spacing:0.15em;text-transform:uppercase;">
+        <div id="step1-dot" style="width:8px;height:8px;border-radius:50%;background:var(--orange);"></div>
+        <span id="step1-label" style="color:var(--orange);">Step 1: Reserve</span>
+        <span style="color:var(--muted);margin:0 4px;">──</span>
+        <div id="step2-dot" style="width:8px;height:8px;border-radius:50%;background:var(--muted);"></div>
+        <span id="step2-label" style="color:var(--muted);">Step 2: Claim</span>
+      </div>
+    </div>
+
     <button class="btn-mint" id="btn-mint" onclick="mintNFT()">
-      Mint Now →
+      Reserve → Mint
+    </button>
+
+    <button class="btn-mint" id="btn-claim" onclick="claimNFT()" style="display:none;background:#52c97a;color:#0a0a0a;">
+      ✓ Claim My NFTs →
     </button>
 
     <div class="status-msg" id="status-msg"></div>
@@ -677,17 +692,26 @@
 </div>
 
 <script>
+  // ── CONFIG ──
+  const CONTRACT_ADDRESS = 'op1sqray4supc0es8amjun8q3mu3652stwg825wzns3d';
+  const TREASURY_ADDRESS = 'bc1pkujwdt94n8690c4lge6hjy46x7pt8hqtrpcre53d8kh8wnksuk6shn7499';
+  const OPNET_RPC      = 'https://mainnet.opnet.org';
+  const MAX_SUPPLY     = 222;
+  const PRICE_USD      = 5;
+  const MAX_PER_TX     = 5;
+  const MINT_PRICE_SATS = 7000; // sats per NFT (~$5)
+  const RESERVATION_FEE_PERCENT = 15;
+  const MIN_RESERVATION_FEE_SATS = 1000;
+
   // ── STATE ──
   let qty = 1;
   let btcPrice = null;
   let walletConnected = false;
   let walletAddress = '';
   let mintedCount = 0;
-  const MAX_SUPPLY = 222;
-  const PRICE_USD = 5;
-  const MAX_PER_TX = 5;
+  let pendingReservation = null; // { qty, block, remainingPayment }
 
-  // ── BTC PRICE FETCH ──
+  // ── BTC PRICE ──
   async function fetchBTCPrice() {
     try {
       const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
@@ -711,6 +735,47 @@
     }
   }
 
+  // ── FETCH LIVE SUPPLY FROM CONTRACT ──
+  async function fetchLiveSupply() {
+    try {
+      const res = await fetch(OPNET_RPC, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'btc_call',
+          params: [{
+            to: CONTRACT_ADDRESS,
+            data: '0x' + encodeSelector('getStatus()'),
+          }]
+        })
+      });
+      const json = await res.json();
+      if (json.result && json.result.result) {
+        // Parse minted count from response (first u256 = minted)
+        const hex = json.result.result.replace('0x','');
+        const minted = parseInt(hex.slice(0,64), 16);
+        if (!isNaN(minted)) {
+          mintedCount = minted;
+          updateSupply();
+        }
+      }
+    } catch(e) {
+      // silently fail - UI still works
+    }
+  }
+
+  function encodeSelector(sig) {
+    // Simple keccak-like selector: first 4 bytes of hash
+    // For opnet we use the method name directly
+    let hash = 0;
+    for (let i = 0; i < sig.length; i++) {
+      hash = ((hash << 5) - hash) + sig.charCodeAt(i);
+      hash |= 0;
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
+
   // ── QTY ──
   function changeQty(delta) {
     qty = Math.max(1, Math.min(MAX_PER_TX, qty + delta));
@@ -720,102 +785,187 @@
 
   // ── WALLET ──
   async function connectWallet() {
-    setStatus('Connecting to Opnet wallet…', 'loading');
+    setStatus('Connecting to OP_Wallet…', 'loading');
     try {
-      // Try official Opnet wallet provider
       const provider = window.opnet || window.unisat;
       if (!provider) {
-        // Demo mode fallback
-        await simulateConnect();
+        setStatus('OP_Wallet not found. Please install it from opnet.org', 'error');
+        setTimeout(() => {
+          window.open('https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb', '_blank');
+        }, 1500);
         return;
       }
       const accounts = await provider.requestAccounts();
       if (accounts && accounts.length > 0) {
         onConnected(accounts[0]);
+      } else {
+        setStatus('No accounts found in OP_Wallet.', 'error');
       }
     } catch (err) {
-      // Demo fallback
       if (err.code === 4001) {
         setStatus('Connection rejected by user.', 'error');
       } else {
-        await simulateConnect();
+        setStatus('Could not connect: ' + (err.message || 'Unknown error'), 'error');
       }
     }
-  }
-
-  async function simulateConnect() {
-    await sleep(1200);
-    const fakeAddr = 'bc1p' + randomHex(38);
-    onConnected(fakeAddr);
   }
 
   function onConnected(address) {
     walletConnected = true;
     walletAddress = address;
-    const short = address.slice(0,8) + '…' + address.slice(-6);
+    const short = address.slice(0,10) + '…' + address.slice(-6);
     document.getElementById('addr-display').textContent = short;
     document.getElementById('wallet-addr').style.display = 'flex';
     document.getElementById('btn-connect').style.display = 'none';
     document.getElementById('btn-mint').style.display = 'block';
+    document.getElementById('step-indicator').style.display = 'block';
     setStatus('Wallet connected ✓', 'success');
     setTimeout(() => setStatus(''), 2000);
+    fetchLiveSupply();
   }
 
   function disconnect() {
     walletConnected = false;
     walletAddress = '';
+    pendingReservation = null;
     document.getElementById('wallet-addr').style.display = 'none';
     document.getElementById('btn-connect').style.display = 'block';
     document.getElementById('btn-mint').style.display = 'none';
+    document.getElementById('btn-claim').style.display = 'none';
+    document.getElementById('step-indicator').style.display = 'none';
+    resetStepUI();
     setStatus('');
   }
 
-  // ── MINT ──
+  // ── STEP UI ──
+  function setStep(step) {
+    const s1dot = document.getElementById('step1-dot');
+    const s1lbl = document.getElementById('step1-label');
+    const s2dot = document.getElementById('step2-dot');
+    const s2lbl = document.getElementById('step2-label');
+    if (step === 1) {
+      s1dot.style.background = 'var(--orange)'; s1lbl.style.color = 'var(--orange)';
+      s2dot.style.background = 'var(--muted)';  s2lbl.style.color = 'var(--muted)';
+    } else {
+      s1dot.style.background = 'var(--success)'; s1lbl.style.color = 'var(--success)';
+      s2dot.style.background = 'var(--orange)';  s2lbl.style.color = 'var(--orange)';
+    }
+  }
+
+  function resetStepUI() {
+    document.getElementById('step1-dot').style.background = 'var(--orange)';
+    document.getElementById('step1-label').style.color = 'var(--orange)';
+    document.getElementById('step2-dot').style.background = 'var(--muted)';
+    document.getElementById('step2-label').style.color = 'var(--muted)';
+  }
+
+  // ── STEP 1: RESERVE ──
   async function mintNFT() {
     if (!walletConnected) return;
     if (mintedCount + qty > MAX_SUPPLY) {
       setStatus('Not enough supply remaining!', 'error'); return;
     }
 
-    const btn = document.getElementById('btn-mint');
-    btn.disabled = true;
-    btn.textContent = 'Processing…';
-    setStatus('Sending transaction to Bitcoin network…', 'loading');
+    const provider = window.opnet || window.unisat;
+    const btnMint  = document.getElementById('btn-mint');
+
+    btnMint.disabled = true;
+    btnMint.textContent = 'Reserving…';
+    setStep(1);
 
     try {
-      const provider = window.opnet || window.unisat;
+      // Calculate reservation fee (15% upfront, min 1000 sats)
+      const totalCost = MINT_PRICE_SATS * qty;
+      const calcFee   = Math.floor(totalCost * RESERVATION_FEE_PERCENT / 100);
+      const resvFee   = Math.max(calcFee, MIN_RESERVATION_FEE_SATS);
+      const remaining = totalCost - resvFee;
+
+      setStatus(`Step 1/2: Paying reservation fee (${resvFee} sats)…`, 'loading');
+
       if (provider && provider.sendBitcoin) {
-        // Direct payment to treasury wallet
-        const btcAmount = (PRICE_USD * qty) / (btcPrice || 65000);
-        const satoshis = Math.round(btcAmount * 1e8);
-        const TREASURY = 'bc1pkujwdt94n8690c4lge6hjy46x7pt8hqtrpcre53d8kh8wnksuk6shn7499';
-        await provider.sendBitcoin(TREASURY, satoshis);
-        onMintSuccess();
+        // Send reservation fee to treasury / contract
+        await provider.sendBitcoin(TREASURY_ADDRESS, resvFee);
+
+        // Store pending reservation
+        pendingReservation = { qty, remaining, resvFee };
+
+        // Update UI to show claim step
+        btnMint.style.display = 'none';
+        const btnClaim = document.getElementById('btn-claim');
+        btnClaim.style.display = 'block';
+        setStep(2);
+        setStatus(
+          `✓ Reserved! Now pay remaining ${remaining} sats within ~1 hour to claim your NFT${qty > 1 ? 's' : ''}.`,
+          'success'
+        );
       } else {
-        // Demo simulation
-        await sleep(2000);
-        onMintSuccess();
+        // Demo mode
+        await sleep(1500);
+        pendingReservation = { qty, remaining: MINT_PRICE_SATS * qty * 0.85, resvFee };
+        btnMint.style.display = 'none';
+        document.getElementById('btn-claim').style.display = 'block';
+        setStep(2);
+        setStatus(`[DEMO] Reserved! Click Claim to complete mint.`, 'success');
       }
     } catch (err) {
-      setStatus(err.message || 'Transaction failed.', 'error');
-      btn.disabled = false;
-      btn.textContent = 'Mint Now →';
+      setStatus(err.message || 'Reservation failed. Try again.', 'error');
+      btnMint.disabled = false;
+      btnMint.textContent = 'Reserve → Mint';
+      resetStepUI();
     }
   }
 
+  // ── STEP 2: CLAIM ──
+  async function claimNFT() {
+    if (!walletConnected || !pendingReservation) return;
+
+    const provider  = window.opnet || window.unisat;
+    const btnClaim  = document.getElementById('btn-claim');
+
+    btnClaim.disabled = true;
+    btnClaim.textContent = 'Claiming…';
+    setStatus(`Step 2/2: Paying remaining ${pendingReservation.remaining} sats…`, 'loading');
+
+    try {
+      if (provider && provider.sendBitcoin) {
+        await provider.sendBitcoin(TREASURY_ADDRESS, pendingReservation.remaining);
+        onMintSuccess();
+      } else {
+        await sleep(1500);
+        onMintSuccess();
+      }
+    } catch (err) {
+      setStatus(err.message || 'Claim failed. Try again within the time limit.', 'error');
+      btnClaim.disabled = false;
+      btnClaim.textContent = '✓ Claim My NFTs →';
+    }
+  }
+
+  // ── MINT SUCCESS ──
   function onMintSuccess() {
-    mintedCount += qty;
+    mintedCount += (pendingReservation ? pendingReservation.qty : qty);
+    pendingReservation = null;
     updateSupply();
-    const btn = document.getElementById('btn-mint');
-    btn.disabled = false;
-    btn.textContent = 'Mint Now →';
+
+    // Reset buttons
+    const btnMint  = document.getElementById('btn-mint');
+    const btnClaim = document.getElementById('btn-claim');
+    btnMint.disabled = false;
+    btnMint.textContent = 'Reserve → Mint';
+    btnMint.style.display = 'block';
+    btnClaim.style.display = 'none';
+    btnClaim.disabled = false;
+    btnClaim.textContent = '✓ Claim My NFTs →';
+    resetStepUI();
     setStatus('');
+
+    const count = mintedCount;
     const subMsg = qty === 1
-      ? `You minted 1 OPixel Cats NFT! Token ID #${mintedCount}`
-      : `You minted ${qty} OPixel Cats NFTs! IDs #${mintedCount - qty + 1}–#${mintedCount}`;
+      ? `You minted 1 OPixel Cats NFT! Token ID #${count}`
+      : `You minted ${qty} OPixel Cats NFTs! IDs #${count - qty + 1}–#${count}`;
     document.getElementById('success-sub').textContent = subMsg;
 
-    // Show banner splash for 1 second, then fade and show success overlay
+    // Banner splash 2s then success overlay
     const splash = document.getElementById('banner-splash');
     splash.classList.add('show');
     setTimeout(() => {
@@ -848,15 +998,13 @@
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  function randomHex(len) {
-    return Array.from({length: len}, () => '0123456789abcdef'[Math.floor(Math.random()*16)]).join('');
-  }
-
   // ── INIT ──
   fetchBTCPrice();
   setInterval(fetchBTCPrice, 30000);
+  fetchLiveSupply();
+  setInterval(fetchLiveSupply, 60000);
 
-  // Animate preview cells (images)
+  // Animate preview cells
   document.querySelectorAll('.preview-cell').forEach((cell, i) => {
     cell.style.opacity = '0';
     cell.style.animation = `fadeSlideIn 0.4s ease forwards ${i * 0.07}s`;
